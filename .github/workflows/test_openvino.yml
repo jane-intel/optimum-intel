@@ -21,7 +21,7 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.8", "3.12"]
-        transformers-version: ["4.36.0", "4.41.*"]
+        transformers-version: ["4.36.0", "4.42.*"]
         os: [ubuntu-latest]
 
     runs-on: ${{ matrix.os }}
@@ -39,6 +39,8 @@ jobs:
         pip install transformers==${{ matrix.transformers-version }}
         pip install .[openvino,openvino-tokenizers,tests,diffusers] onnxruntime
     - name: Test with Pytest
+      env:
+        HF_HUB_READ_TOKEN: ${{ secrets.HF_HUB_READ_TOKEN }}
       run: |
         pytest tests/openvino/ --ignore tests/openvino/test_modeling_basic.py --durations=0
     - name: Test basic

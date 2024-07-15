@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 class OVBaseModel(OptimizedModel):
     auto_model_class = None
     export_feature = None
+    _supports_cache_class = False
 
     def __init__(
         self,
@@ -131,7 +132,11 @@ class OVBaseModel(OptimizedModel):
 
         if isinstance(file_name, str):
             file_name = Path(file_name)
-        model = core.read_model(file_name) if not file_name.suffix == ".onnx" else convert_model(file_name)
+        model = (
+            core.read_model(file_name.resolve(), file_name.with_suffix(".bin").resolve())
+            if not file_name.suffix == ".onnx"
+            else convert_model(file_name)
+        )
         if file_name.suffix == ".onnx":
             model = fix_op_names_duplicates(model)  # should be called during model conversion to IR
 
@@ -553,3 +558,27 @@ class OVBaseModel(OptimizedModel):
         if isinstance(self, GenerationMixin):
             return True
         return False
+
+    def _inference(self, inputs):
+        try:
+            outputs = self.request(inputs)
+        except Exception as e:
+            invalid_inputs_msg = self._incompatible_inputs_warning(inputs)
+            if invalid_inputs_msg is not None:
+                e.args += (invalid_inputs_msg,)
+            raise e
+        return outputs
+
+    def _incompatible_inputs_warning(self, inputs: Dict):
+        expected_inputs_names = set(self.input_names.keys())
+        inputs_names = set(inputs.keys())
+
+        if expected_inputs_names != inputs_names:
+            return f"Got unexpected inputs: expecting the following inputs {expected_inputs_names} but got {inputs_names}."
+
+        for input_name in inputs:
+            if inputs[input_name] is None:
+                dtype = self.request.inputs[self.input_names[input_name]].get_element_type()
+                return f"Got unexpected inputs: `{input_name}` set to {type(inputs[input_name])} while expected to be {dtype}."
+
+        return None

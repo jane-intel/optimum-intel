@@ -89,15 +89,22 @@ class IPEXModelTest(unittest.TestCase):
             transformers_outputs = transformers_model(**tokens)
         outputs = ipex_model(**tokens)
 
+        # Test re-load model
         with tempfile.TemporaryDirectory() as tmpdirname:
             ipex_model.save_pretrained(tmpdirname)
             loaded_model = self.IPEX_MODEL_CLASS.from_pretrained(tmpdirname)
             loaded_model_outputs = loaded_model(**tokens)
+        # Test init method
+        init_model = self.IPEX_MODEL_CLASS(transformers_model, export=True)
+        init_model_outputs = init_model(**tokens)
+        self.assertIsInstance(init_model.model, torch.jit.RecursiveScriptModule)
+
         # Compare tensor outputs
         for output_name in {"logits", "last_hidden_state"}:
             if output_name in transformers_outputs:
                 self.assertTrue(torch.allclose(outputs[output_name], transformers_outputs[output_name], atol=1e-4))
                 self.assertTrue(torch.equal(outputs[output_name], loaded_model_outputs[output_name]))
+                self.assertTrue(torch.equal(outputs[output_name], init_model_outputs[output_name]))
 
     @parameterized.expand(SUPPORTED_ARCHITECTURES)
     def test_pipeline(self, model_arch):
@@ -147,10 +154,16 @@ class IPEXModelForQuestionAnsweringTest(unittest.TestCase):
             transformers_outputs = transformers_model(**tokens)
         outputs = ipex_model(**tokens)
 
+        # Test re-load model
         with tempfile.TemporaryDirectory() as tmpdirname:
             ipex_model.save_pretrained(tmpdirname)
             loaded_model = self.IPEX_MODEL_CLASS.from_pretrained(tmpdirname)
             loaded_model_outputs = loaded_model(**tokens)
+
+        # Test init method
+        init_model = self.IPEX_MODEL_CLASS(transformers_model, export=True)
+        init_model_outputs = init_model(**tokens)
+        self.assertIsInstance(init_model.model, torch.jit.RecursiveScriptModule)
 
         self.assertIn("start_logits", outputs)
         self.assertIn("end_logits", outputs)
@@ -159,6 +172,8 @@ class IPEXModelForQuestionAnsweringTest(unittest.TestCase):
         self.assertTrue(torch.allclose(outputs.end_logits, transformers_outputs.end_logits, atol=1e-4))
         self.assertTrue(torch.equal(outputs.start_logits, loaded_model_outputs.start_logits))
         self.assertTrue(torch.equal(outputs.end_logits, loaded_model_outputs.end_logits))
+        self.assertTrue(torch.equal(outputs.start_logits, init_model_outputs.start_logits))
+        self.assertTrue(torch.equal(outputs.end_logits, init_model_outputs.end_logits))
 
     @parameterized.expand(SUPPORTED_ARCHITECTURES)
     def test_pipeline(self, model_arch):
@@ -172,6 +187,21 @@ class IPEXModelForQuestionAnsweringTest(unittest.TestCase):
         self.assertEqual(pipe.device, model.device)
         self.assertGreaterEqual(outputs["score"], 0.0)
         self.assertIsInstance(outputs["answer"], str)
+
+    @unittest.skipIf(is_ipex_version("<", "2.3.0"), reason="Only ipex version > 2.3.0 supports ipex model patching")
+    def test_patched_model(self):
+        ipex_model = IPEXModelForQuestionAnswering.from_pretrained(
+            "Jiqing/patched_tiny_random_bert_for_question_answering"
+        )
+        transformers_model = AutoModelForQuestionAnswering.from_pretrained("hf-internal-testing/tiny-random-bert")
+        tokenizer = AutoTokenizer.from_pretrained("hf-internal-testing/tiny-random-bert")
+        inputs = "This is a sample input"
+        tokens = tokenizer(inputs, return_tensors="pt")
+        with torch.no_grad():
+            transformers_outputs = transformers_model(**tokens)
+        outputs = ipex_model(**tokens)
+        self.assertTrue(torch.allclose(outputs.start_logits, transformers_outputs.start_logits, atol=1e-4))
+        self.assertTrue(torch.allclose(outputs.end_logits, transformers_outputs.end_logits, atol=1e-4))
 
 
 class IPEXModelForCausalLMTest(unittest.TestCase):
@@ -220,13 +250,21 @@ class IPEXModelForCausalLMTest(unittest.TestCase):
         with torch.no_grad():
             transformers_outputs = transformers_model(**tokens)
 
+        # Test re-load model
         with tempfile.TemporaryDirectory() as tmpdirname:
             ipex_model.save_pretrained(tmpdirname)
             loaded_model = self.IPEX_MODEL_CLASS.from_pretrained(tmpdirname)
             loaded_model_outputs = loaded_model(**inputs)
+
+        # Test init method
+        init_model = self.IPEX_MODEL_CLASS(transformers_model, export=True)
+        init_model_outputs = init_model(**inputs)
+        self.assertIsInstance(init_model.model, torch.jit.RecursiveScriptModule)
+
         # Compare tensor outputs
         self.assertTrue(torch.allclose(outputs.logits, transformers_outputs.logits, atol=1e-4))
         self.assertTrue(torch.equal(outputs.logits, loaded_model_outputs.logits))
+        self.assertTrue(torch.equal(outputs.logits, init_model_outputs.logits))
 
     @parameterized.expand(SUPPORTED_ARCHITECTURES)
     def test_pipeline(self, model_arch):
@@ -354,13 +392,21 @@ class IPEXModelForAudioClassificationTest(unittest.TestCase):
             transformers_outputs = transformers_model(**inputs)
         outputs = ipex_model(**inputs)
 
+        # Test re-load model
         with tempfile.TemporaryDirectory() as tmpdirname:
             ipex_model.save_pretrained(tmpdirname)
             loaded_model = self.IPEX_MODEL_CLASS.from_pretrained(tmpdirname)
             loaded_model_outputs = loaded_model(**inputs)
+
+        # Test init method
+        init_model = self.IPEX_MODEL_CLASS(transformers_model, export=True)
+        init_model_outputs = init_model(**inputs)
+        self.assertIsInstance(init_model.model, torch.jit.RecursiveScriptModule)
+
         # Compare tensor outputs
         self.assertTrue(torch.allclose(outputs.logits, transformers_outputs.logits, atol=1e-3))
         self.assertTrue(torch.equal(outputs.logits, loaded_model_outputs.logits))
+        self.assertTrue(torch.equal(outputs.logits, init_model_outputs.logits))
 
     @parameterized.expand(SUPPORTED_ARCHITECTURES)
     def test_pipeline(self, model_arch):
@@ -400,15 +446,22 @@ class IPEXModelForImageClassificationIntegrationTest(unittest.TestCase):
             transformers_outputs = transformers_model(**inputs)
         outputs = ipex_model(**inputs)
 
+        # Test re-load model
         with tempfile.TemporaryDirectory() as tmpdirname:
             ipex_model.save_pretrained(tmpdirname)
             loaded_model = self.IPEX_MODEL_CLASS.from_pretrained(tmpdirname)
             loaded_model_outputs = loaded_model(**inputs)
 
+        # Test init method
+        init_model = self.IPEX_MODEL_CLASS(transformers_model, export=True)
+        init_model_outputs = init_model(**inputs)
+        self.assertIsInstance(init_model.model, torch.jit.RecursiveScriptModule)
+
         self.assertIn("logits", outputs)
         # Compare tensor outputs
         self.assertTrue(torch.allclose(outputs.logits, transformers_outputs.logits, atol=1e-4))
         self.assertTrue(torch.equal(outputs.logits, loaded_model_outputs.logits))
+        self.assertTrue(torch.allclose(init_model_outputs.logits, transformers_outputs.logits, atol=1e-4))
 
     @parameterized.expand(SUPPORTED_ARCHITECTURES)
     def test_pipeline(self, model_arch):
@@ -420,3 +473,18 @@ class IPEXModelForImageClassificationIntegrationTest(unittest.TestCase):
         self.assertEqual(pipe.device, model.device)
         self.assertGreaterEqual(outputs[0]["score"], 0.0)
         self.assertTrue(isinstance(outputs[0]["label"], str))
+
+    @unittest.skipIf(is_ipex_version("<", "2.3.0"), reason="Only ipex version > 2.3.0 supports ipex model patching")
+    def test_patched_model(self):
+        ipex_model = IPEXModelForImageClassification.from_pretrained(
+            "Jiqing/patched_tiny_random_vit_for_image_classification"
+        )
+        transformers_model = self.IPEX_MODEL_CLASS.from_pretrained("hf-internal-testing/tiny-random-vit")
+        preprocessor = AutoFeatureExtractor.from_pretrained("hf-internal-testing/tiny-random-vit")
+        url = "http://images.cocodataset.org/val2017/000000039769.jpg"
+        image = Image.open(requests.get(url, stream=True).raw)
+        inputs = preprocessor(images=image, return_tensors="pt")
+        with torch.no_grad():
+            transformers_outputs = transformers_model(**inputs)
+        outputs = ipex_model(**inputs)
+        self.assertTrue(torch.allclose(outputs.logits, transformers_outputs.logits, atol=1e-4))

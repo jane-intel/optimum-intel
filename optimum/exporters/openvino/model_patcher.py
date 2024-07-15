@@ -190,7 +190,7 @@ def _chatglm_transformer_forward(
     if inputs_embeds is None:
         inputs_embeds = self.embedding(input_ids)
 
-    if self.pre_seq_len is not None:
+    if getattr(self, "pre_seq_len", None) is not None:
         if past_key_values is None:
             past_key_values = self.get_prompt(
                 batch_size=batch_size,
@@ -285,6 +285,17 @@ def _chatglm2_core_attention_forward(self, query_layer, key_layer, value_layer, 
     return context_layer
 
 
+def _glm4_core_attention_forward(self, query_layer, key_layer, value_layer, attention_mask):
+    attention_mask = ~attention_mask
+    context_layer = torch.nn.functional.scaled_dot_product_attention(
+        query_layer, key_layer, value_layer, attention_mask.to(torch.float32)
+    )
+    context_layer = context_layer.transpose(1, 2).contiguous()
+    new_context_layer_shape = context_layer.size()[:-2] + (self.hidden_size_per_partition,)
+    context_layer = context_layer.reshape(*new_context_layer_shape)
+    return context_layer
+
+
 class ChatGLMModelPatcher(DecoderModelPatcher):
     def __init__(
         self,
@@ -293,21 +304,25 @@ class ChatGLMModelPatcher(DecoderModelPatcher):
         model_kwargs: Dict[str, Any],
     ):
         super().__init__(config, model, model_kwargs)
-
-        self.original_chatglm_transformer_forward = model.transformer.forward
+        self.is_v4 = hasattr(self._model.config, "rope_ratio")
 
     def __enter__(self):
         super().__enter__()
-        self._model.transformer.forward = types.MethodType(_chatglm_transformer_forward, self._model.transformer)
+
+        if not self.is_v4:
+            self._model.transformer._orig_forward = self._model.transformer.forward
+            self._model.transformer.forward = types.MethodType(_chatglm_transformer_forward, self._model.transformer)
         for block in self._model.transformer.encoder.layers:
             block.self_attention.core_attention._orig_forward = block.self_attention.core_attention.forward
             block.self_attention.core_attention.forward = types.MethodType(
-                _chatglm2_core_attention_forward, block.self_attention.core_attention
+                _chatglm2_core_attention_forward if not self.is_v4 else _glm4_core_attention_forward,
+                block.self_attention.core_attention,
             )
 
     def __exit__(self, exc_type, exc_value, traceback):
         super().__exit__(exc_type, exc_value, traceback)
-        self._model.transformer.forward = self.original_chatglm_transformer_forward
+        if hasattr(self._model.transformer, "_orig_forward"):
+            self._model.transformer.forward = self._model.transformer._orig_forward
         for block in self._model.transformer.encoder.layers:
             block.self_attention.core_attention.forward = block.self_attention.core_attention._orig_forward
 
@@ -482,11 +497,24 @@ else:
     _llama_gemma_update_causal_mask = _llama_gemma_update_causal_mask_legacy
 
 
-class GemmaModelPatcher(DecoderModelPatcher):
+def llama_gemma_rotary_emb_forward(self, x, position_ids, seq_len=None):
+    # adopted from https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma/modeling_gemma.py#L104
+    _seq_len = torch.max(position_ids) + 1 if seq_len is None else seq_len
+    if _seq_len > self.embed_positions.shape[0]:
+        if seq_len is None:
+            return self._orig_forward(x, position_ids)
+        else:
+            return self._orig_forward(x, position_ids, seq_len)
+    sincos = self.embed_positions[position_ids]
+    sin, cos = torch.split(sincos, sincos.shape[-1] // 2, dim=-1)
+    return cos, sin
+
+
+class LlamaModelPatcher(DecoderModelPatcher):
     def __enter__(self):
         super().__enter__()
 
-        # gemma has some accuracy issues with bf16 with transformers >= 4.39
+        # llama/gemma has some accuracy issues with bf16 with transformers >= 4.39
         # fill causal mask in slightly different way for avoid overflow on some platforms
         if is_transformers_version(">=", "4.39.0"):
             self._model.model._orig_update_causal_mask = self._model.model._update_causal_mask
@@ -494,13 +522,30 @@ class GemmaModelPatcher(DecoderModelPatcher):
                 _llama_gemma_update_causal_mask, self._model.model
             )
 
-        # init inv_freq for torchscript tracing
-        # https://github.com/huggingface/transformers/blob/ed74d97871468f3a4695ede50abdc0b55717a84d/src/transformers/models/gemma/modeling_gemma.py#L108
-        for layer in self._model.model.layers:
-            if layer.self_attn.rotary_emb.inv_freq is None:
-                rotary_emb = layer.self_attn.rotary_emb
-                layer.self_attn.rotary_emb.inv_freq = 1.0 / (
-                    rotary_emb.base ** (torch.arange(0, rotary_emb.dim, 2, dtype=torch.int64).float() / rotary_emb.dim)
+            max_positions = self._model.config.max_position_embeddings
+
+            # cos/sin for rotary position embeddings also having issues with bf16 and efficiency due to calculation on each step
+            # use precomputed
+            def create_sinusoidal_positions(num_pos: int, dim: int, base: int = 10000) -> torch.Tensor:
+                # adopted from https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py#L101
+                inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64) / dim))
+
+                sinusoid_inp = torch.einsum(
+                    "i , j -> i j", torch.arange(num_pos, dtype=torch.int64).float(), inv_freq
+                ).float()
+                emb = torch.cat((sinusoid_inp, sinusoid_inp), dim=-1)
+                return torch.cat((torch.sin(emb), torch.cos(emb)), dim=1)
+
+            base = self._model.model.layers[0].self_attn.rotary_emb.base
+            dim = self._model.model.layers[0].self_attn.rotary_emb.dim
+            embed_positions = create_sinusoidal_positions(max_positions, dim, base)
+
+            for layer in self._model.model.layers:
+                layer.self_attn.rotary_emb.register_buffer("embed_positions", embed_positions)
+                layer.self_attn.rotary_emb._orig_forward = layer.self_attn.rotary_emb.forward
+
+                layer.self_attn.rotary_emb.forward = types.MethodType(
+                    llama_gemma_rotary_emb_forward, layer.self_attn.rotary_emb
                 )
 
     def __exit__(self, exc_type, exc_value, traceback):
@@ -508,23 +553,8 @@ class GemmaModelPatcher(DecoderModelPatcher):
         if hasattr(self._model.model, "_orig_update_causal_mask"):
             self._model.model._update_causal_mask = self._model.model._orig_update_causal_mask
 
-
-class LlamaModelPatcher(DecoderModelPatcher):
-    def __enter__(self):
-        super().__enter__()
-
-        # llama has some accuracy issues with bf16 with transformers >= 4.39
-        # fill causal mask in slightly different way for avoid overflow on some platforms
-        if is_transformers_version(">=", "4.39.0"):
-            self._model.model._orig_update_causal_mask = self._model.model._update_causal_mask
-            self._model.model._update_causal_mask = types.MethodType(
-                _llama_gemma_update_causal_mask, self._model.model
-            )
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        super().__exit__(exc_type, exc_value, traceback)
-        if hasattr(self._model.model, "_orig_update_causal_mask"):
-            self._model.model._update_causal_mask = self._model.model._orig_update_causal_mask
+            for layer in self._model.model.layers:
+                layer.self_attn.rotary_emb.forward = layer.self_attn.rotary_emb._orig_forward
 
 
 SUPPORT_SDPA = is_torch_version(">", "2.1.0")
@@ -1058,10 +1088,13 @@ def _internlm2_attention_forward(
         x2 = x[..., x.shape[-1] // 2 :]
         return torch.cat((-x2, x1), dim=-1)
 
-    def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
+    def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
         """Applies Rotary Position Embedding to the query and key tensors."""
-        cos = cos[position_ids].unsqueeze(unsqueeze_dim)
-        sin = sin[position_ids].unsqueeze(unsqueeze_dim)
+        if position_ids is not None:
+            cos = cos[position_ids]
+            sin = sin[position_ids]
+        cos = cos.unsqueeze(unsqueeze_dim)
+        sin = sin.unsqueeze(unsqueeze_dim)
         q_embed = (q * cos) + (rotate_half(q) * sin)
         k_embed = (k * cos) + (rotate_half(k) * sin)
         return q_embed, k_embed
@@ -1098,17 +1131,24 @@ def _internlm2_attention_forward(
     value_states = value_states.transpose(1, 2)
 
     kv_seq_len = key_states.shape[-2]
-    if past_key_value is not None:
-        kv_seq_len += past_key_value[0].shape[-2]
-    cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    is_legacy = not hasattr(self, "layer_idx")
 
-    if past_key_value is not None:
-        # reuse k, v, self_attention
-        key_states = torch.cat([past_key_value[0], key_states], dim=2)
-        value_states = torch.cat([past_key_value[1], value_states], dim=2)
+    if is_legacy:
+        if past_key_value is not None:
+            kv_seq_len += past_key_value[0].shape[-2]
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        if past_key_value is not None:
+            key_states = torch.cat([past_key_value[0], key_states], dim=2)
+            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+        past_key_value = (key_states, value_states) if use_cache else None
+    else:
+        cos, sin = self.rotary_emb(value_states, position_ids)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-    past_key_value = (key_states, value_states) if use_cache else None
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": kwargs.get("cache_position")}
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -1146,7 +1186,7 @@ class InternLM2Patcher(DecoderModelPatcher):
                 block.attention.forward = block.attention._orig_forward
 
 
-# Adapted from https://github.com/huggingface/transformers/blob/ccdabc5642bf84849af93f591e207dc625c8e1e1/src/transformers/models/phi3/modeling_phi3.py#L426
+# Adapted from https://github.com/huggingface/transformers/blob/ccdabc5642bf84849af93f591e207dc625c8e1e1/src/transformers/models/phi3/modeling_phi3.py#L729
 def _phi3_self_attn_sdpa_forward(
     self,
     hidden_states: torch.Tensor,
@@ -1155,6 +1195,7 @@ def _phi3_self_attn_sdpa_forward(
     past_key_value: Optional[Tuple[torch.Tensor]] = None,
     output_attentions: bool = False,
     use_cache: bool = False,
+    cache_position: Optional[torch.LongTensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
     if output_attentions:
         return self._orig_forward(
@@ -1166,10 +1207,9 @@ def _phi3_self_attn_sdpa_forward(
             use_cache=use_cache,
         )
 
-    # TO DO: remove llama imports when transformers with phi3 support will be released
-    try:
-        from transformers.models.phi3.modelling_phi3 import apply_rotary_pos_emb, repeat_kv
-    except ImportError:
+    if is_transformers_version(">=", "4.41.0"):
+        from transformers.models.phi3.modeling_phi3 import apply_rotary_pos_emb, repeat_kv
+    else:
         from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, repeat_kv
 
     bsz, q_len, _ = hidden_states.size()
@@ -1191,17 +1231,15 @@ def _phi3_self_attn_sdpa_forward(
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     if past_key_value is not None:
-        cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
+        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
         key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
+    causal_mask = attention_mask
     if attention_mask is not None:
-        if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-            )
+        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
 
     # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
     # Reference: https://github.com/pytorch/pytorch/issues/112577.
@@ -1214,7 +1252,7 @@ def _phi3_self_attn_sdpa_forward(
         query_states,
         key_states,
         value_states,
-        attn_mask=attention_mask,
+        attn_mask=causal_mask,
         dropout_p=self.attention_dropout if self.training else 0.0,
         # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
         is_causal=self.is_causal and attention_mask is None and q_len > 1,
@@ -1546,7 +1584,7 @@ class CodeGenModelPatcher(DecoderModelPatcher):
                 layer.attn._attn = layer.attn._orig_attn
 
 
-# adapted from https://github.com/huggingface/transformers/blob/v4.40.2/src/transformers/models/dbrx/modeling_dbrx.py#L763
+# Adapted from https://github.com/huggingface/transformers/blob/v4.40.2/src/transformers/models/dbrx/modeling_dbrx.py#L763
 def _dbrx_experts_forward(
     self, x: torch.Tensor, weights: torch.Tensor, top_weights: torch.Tensor, top_experts: torch.LongTensor
 ):
@@ -1591,7 +1629,7 @@ def _dbrx_experts_forward(
     return out
 
 
-# adapted from https://github.com/huggingface/transformers/blob/v4.40.2/src/transformers/models/dbrx/modeling_dbrx.py#L1228
+# Adapted from https://github.com/huggingface/transformers/blob/v4.40.2/src/transformers/models/dbrx/modeling_dbrx.py#L1228
 def _dbrx_update_causal_mask_legacy(
     self, attention_mask: Optional[torch.Tensor], input_tensor: torch.Tensor, cache_position: torch.Tensor
 ) -> Optional[torch.Tensor]:
@@ -1788,6 +1826,7 @@ class DBRXModelPatcher(DecoderModelPatcher):
             block.ffn.experts.forward = block.ffn.experts._orig_forward
 
 
+# Adapted from https://github.com/huggingface/transformers/blob/v4.41.0/src/transformers/models/persimmon/modeling_persimmon.py#L264
 def _persimmon_self_attn_sdpa_forward(
     self,
     hidden_states: torch.Tensor,
@@ -1796,6 +1835,7 @@ def _persimmon_self_attn_sdpa_forward(
     past_key_value: Optional["Cache"] = None,
     output_attentions: bool = False,
     use_cache: bool = False,
+    cache_position: Optional[torch.LongTensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
     from transformers.models.persimmon.modeling_persimmon import apply_rotary_pos_emb
 
@@ -1850,14 +1890,23 @@ def _persimmon_self_attn_sdpa_forward(
 
     if past_key_value is not None:
         # Specific to RoPE models with partial rotation
-        cache_kwargs = {"sin": sin, "cos": cos, "partial_rotation_size": self.rotary_emb.dim}
+        cache_kwargs = {
+            "sin": sin,
+            "cos": cos,
+            "partial_rotation_size": self.rotary_emb.dim,
+            "cache_position": cache_position,
+        }
         key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+    causal_mask = attention_mask
+    if attention_mask is not None:  # no matter the length, we just slice it
+        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
 
     attn_output = F.scaled_dot_product_attention(
         query_states,
         key_states,
         value_states,
-        attention_mask,
+        causal_mask,
         scale=1 / math.sqrt(self.head_dim),
         dropout_p=self.attention_dropout.p,
     )
